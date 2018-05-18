@@ -27,6 +27,7 @@ import android.media.MediaRecorder.AudioSource;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.util.Log;
 import android.widget.ArrayAdapter;
 import android.widget.ListView;
@@ -57,15 +58,18 @@ import io.grpc.stub.StreamObserver;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+
+import org.json.JSONArray;
 import org.json.JSONException;
+import org.json.JSONObject;
 
 public class AssistantActivity extends Activity implements Button.OnButtonEventListener {
     private static final String TAG = AssistantActivity.class.getSimpleName();
 
     // Peripheral and drivers constants.
-    private static final boolean USE_VOICEHAT_DAC = true;
+    private static final boolean USE_VOICEHAT_DAC = false;
     private static final int BUTTON_DEBOUNCE_DELAY_MS = 20;
-
+    private static int mVolumePercentage = 100;
     // Audio constants.
     private static final int SAMPLE_RATE = 16000;
     private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
@@ -125,7 +129,12 @@ public class AssistantActivity extends Activity implements Button.OnButtonEventL
                 }
             }
             if (value.getDialogStateOut() != null) {
-                mConversationState = value.getDialogStateOut().getConversationState();
+                int volume = value.getDialogStateOut().getVolumePercentage();
+                if (volume > 0) {
+                    mVolumePercentage = volume;
+                    Log.i(TAG, "assistant volume changed: " + mVolumePercentage);
+                    mAudioTrack.setVolume(AudioTrack.getMaxVolume() * mVolumePercentage / 100.0f);
+                }
             }
             if (value.getAudioOut() != null) {
                 final ByteBuffer audioData =
@@ -140,11 +149,40 @@ public class AssistantActivity extends Activity implements Button.OnButtonEventL
                     }
                 }
             }
+            if (value.getDeviceAction() != null &&
+                    !value.getDeviceAction().getDeviceRequestJson().isEmpty()) {
+                // Iterate through JSON object
+                try {
+                    JSONObject deviceAction =
+                            new JSONObject(value.getDeviceAction().getDeviceRequestJson());
+                    JSONArray inputs = deviceAction.getJSONArray("inputs");
+                    for (int i = 0; i < inputs.length(); i++) {
+                        if (inputs.getJSONObject(i).getString("intent")
+                                .equals("action.devices.EXECUTE")) {
+                            JSONArray commands = inputs.getJSONObject(i)
+                                    .getJSONObject("payload")
+                                    .getJSONArray("commands");
+                            for (int j = 0; j < commands.length(); j++) {
+                                JSONArray execution = commands.getJSONObject(j)
+                                        .getJSONArray("execution");
+                                for (int k = 0; k < execution.length(); k++) {
+                                    String command = execution.getJSONObject(k)
+                                            .getString("command");
+                                    JSONObject params = execution.getJSONObject(k)
+                                            .optJSONObject("params");
+                                    handleDeviceAction(command, params);
+                                }
+                            }
+                        }
+                    }
+                } catch (JSONException | IOException e) {
+                    e.printStackTrace();
+                }
+            }
         }
-
         @Override
         public void onError(Throwable t) {
-            Log.e(TAG, "converse error:", t);
+            Log.e(TAG, "converse error:"+t.getMessage(), t);
         }
 
         @Override
@@ -191,6 +229,30 @@ public class AssistantActivity extends Activity implements Button.OnButtonEventL
             }
         }
     };
+    public void handleDeviceAction(String command, JSONObject params)
+            throws JSONException, IOException {
+        if (command.equals("action.devices.commands.OnOff")) {
+            turnOnLed.setValue(params.getBoolean("on"));
+        } else if (command.equals("com.example.commands.BlinkLight")) {
+            int delay = 1000;
+            int blinkCount = params.getInt("number");
+            String speed = params.getString("speed");
+            if (speed.equals("slowly")) {
+                delay = 2000;
+            } else if (speed.equals("quickly")) {
+                delay = 500;
+            }
+            for (int i = 0; i < blinkCount*2; i++) {
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    try {
+                        turnOnLed.setValue(!turnOnLed.getValue());
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                }, i * delay);
+            }
+        }
+    }
 
     // Audio playback and recording objects.
     private AudioTrack mAudioTrack;
@@ -203,6 +265,7 @@ public class AssistantActivity extends Activity implements Button.OnButtonEventL
     // Hardware peripherals.
     private Button mButton;
     private Gpio mLed;
+    private Gpio turnOnLed;
     private Max98357A mDac;
 
     // Assistant Thread and Runnables implementing the push-to-talk functionality.
@@ -218,7 +281,11 @@ public class AssistantActivity extends Activity implements Button.OnButtonEventL
             mAssistantRequestObserver = mAssistantService.assist(mAssistantResponseObserver);
             AssistConfig.Builder converseConfigBuilder = AssistConfig.newBuilder()
                     .setAudioInConfig(ASSISTANT_AUDIO_REQUEST_CONFIG)
-                    .setAudioOutConfig(ASSISTANT_AUDIO_RESPONSE_CONFIG)
+                    .setAudioOutConfig(AudioOutConfig.newBuilder()
+                            .setEncoding(ENCODING_OUTPUT)
+                            .setSampleRateHertz(SAMPLE_RATE)
+                            .setVolumePercentage(mVolumePercentage)
+                            .build())
                     .setDeviceConfig(DeviceConfig.newBuilder()
                             .setDeviceModelId(MyDevice.MODEL_ID)
                             .setDeviceId(MyDevice.INSTANCE_ID)
@@ -319,6 +386,7 @@ public class AssistantActivity extends Activity implements Button.OnButtonEventL
                 mButton = new Button(BoardDefaults.getGPIOForButton(),
                     Button.LogicState.PRESSED_WHEN_LOW);
                 mLed = PeripheralManager.getInstance().openGpio(BoardDefaults.getGPIOForLED());
+                turnOnLed = PeripheralManager.getInstance().openGpio("GPIO2_IO05");
             }
 
             mButton.setDebounceDelay(BUTTON_DEBOUNCE_DELAY_MS);
@@ -326,6 +394,8 @@ public class AssistantActivity extends Activity implements Button.OnButtonEventL
 
             mLed.setDirection(Gpio.DIRECTION_OUT_INITIALLY_LOW);
             mLed.setActiveType(Gpio.ACTIVE_HIGH);
+            turnOnLed.setDirection(Gpio.DIRECTION_OUT_INITIALLY_LOW);
+            turnOnLed.setActiveType(Gpio.ACTIVE_HIGH);
         } catch (IOException e) {
             Log.e(TAG, "error configuring peripherals:", e);
             return;
